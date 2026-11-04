@@ -2,7 +2,7 @@ const chalk = require('chalk');
 const dotenv = require('dotenv');
 const moment = require('moment-timezone');
 
-dotenv.config();
+dotenv.config(); 
 
 const config = {
     // Bot Configuration
