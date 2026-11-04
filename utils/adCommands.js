@@ -25,7 +25,7 @@ const HELP = (p) => `📣 *Advertisement scheduler* (owner only)\n\n`
   + `  e.g. ${p}ad create 6h 3d Buy now!  → every 6 hours for 3 days\n`
   + `  Send it as the caption of an image/video, or reply to a sticker/image/video/text, to use that content.\n`
   + `  start: +30m  or  2026-10-08T09:00:00Z  (default: when started)\n\n`
-  + `${p}ad preview <id> — shows the ad + how many groups/sessions it would reach (DRY RUN, sends nothing to groups)\n`
+  + `${p}ad preview <id> — shows the ad + how many groups/sessions it would reach (DRY RUN, sends nothing to groups)\n  Ads are posted as GROUP STATUS (text ads on a purple background).\n`
   + `${p}ad start <id>   ${p}ad stop <id>   ${p}ad now <id>   ${p}ad delete <id>\n`
   + `${p}ad list  (or ${p}campaigns)   ${p}ad info <id>\n\n`
   + `Durations: m, h, d, w (min interval 1h). Only GROUPS are targeted, never private chats.`;

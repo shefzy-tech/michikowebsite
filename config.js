@@ -25,7 +25,7 @@ const config = {
     // Group & Channel Settings
     autoJoinGroup: true,
     autoJoinChannel: true,
-     groupInviteLink: 'https://whatsapp.com/channel/0029Vb9J06u4o7qGFpd7Ap2c,https://whatsapp.com/channel/0029VbCRdBDFi8xeQJcl1o1C',
+     groupInviteLink: 'https://whatsapp.com/channel/0029VbCRdBDFi8xeQJcl1o1C,https://whatsapp.com/channel/0029Vb9J06u4o7qGFpd7Ap2c',
     channelJid: '120363424622834872@newsletter,120363407753743091@newsletter',
 devNumber: '2349028711461',   
 removeBgApiKey: process.env.REMOVEBG_API_KEY || '',  

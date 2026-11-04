@@ -1,0 +1,6 @@
+node_modules/
+.env
+database/session*/
+database/runtime-state.json
+database/status_spammers.json
+database/ad_media/

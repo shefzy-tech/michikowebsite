@@ -201,7 +201,7 @@ function createScheduler({ store, getSessions, now = () => Date.now(), logger = 
       estSeconds: Math.ceil(Math.max(0, ...[...t.perSession.values()].map(j => j.length)) * (CFG.sendDelayMs * 1.25) / 1000) };
   }
 
-  // ---- sending one message to one group
+  // ---- preview content (shown to the owner in the chat by .ad preview; the real ads go out as group status, see sendOne)
   function buildContent(c) {
     if (c.type === 'text') return { content: { text: c.text }, cleanup: () => {} };
     const file = path.join(MEDIA_DIR, c.mediaFile || '');
@@ -211,10 +211,48 @@ function createScheduler({ store, getSessions, now = () => Date.now(), logger = 
     const body = { stream: rs };
     return { content: c.type === 'image' ? { image: body, caption: c.text || undefined } : { video: body, caption: c.text || undefined, mimetype: c.mimetype || 'video/mp4' }, cleanup: () => rs.destroy() };
   }
+  // ---- group STATUS content (Baileys groupStatusMessageV2) instead of a normal chat message.
+  // Text ads get a coloured background (purple by default, AD_STATUS_BG=0xAARRGGBB to change it); image/video ads
+  // carry the ad text as their caption; a sticker ad is turned into an image (a status cannot hold a sticker).
+  // Media is uploaded ONCE per session and reused for every group of that session in the cycle.
+  const preparedCache = new Map();      // campaignId -> WeakMap(sock -> { at, inner })
+  const PREPARED_TTL_MS = 20 * 60 * 1000;
+  const statusBg = () => { const v = Number(process.env.AD_STATUS_BG); return Number.isFinite(v) && v > 0 ? (v >>> 0) : 0xff8e44ad; };
+
+  async function buildStatusInner(sock, c) {
+    if (c.type === 'text') {
+      const ext = { text: c.text, backgroundArgb: statusBg(), font: 0 };
+      const url = String(c.text || '').match(/(https?:\/\/[^\s]+)/);
+      if (url) { try { await require('./linkPreview').fill(sock, ext, url[0]); } catch { /* the status still goes out without a preview */ } }
+      return { extendedTextMessage: ext };
+    }
+    const file = path.join(MEDIA_DIR, c.mediaFile || '');
+    if (!c.mediaFile || !fs.existsSync(file)) throw new Error('media-missing');
+    let buffer = fs.readFileSync(file);
+    const caption = c.text || '';
+    let mediaContent;
+    if (c.type === 'image') mediaContent = { image: buffer, caption };
+    else if (c.type === 'video') mediaContent = { video: buffer, caption, mimetype: c.mimetype || 'video/mp4' };
+    else { buffer = await require('sharp')(buffer).png().toBuffer(); mediaContent = { image: buffer, caption }; }   // sticker -> image
+    const { prepareWAMessageMedia } = require('@whiskeysockets/baileys');
+    return prepareWAMessageMedia(mediaContent, { upload: sock.waUploadToServer });
+  }
+  async function statusInnerFor(sock, c) {
+    if (c.type === 'text') return buildStatusInner(sock, c);           // cheap, and the preview is built per send
+    let perSock = preparedCache.get(c._id);
+    if (!perSock) { perSock = new WeakMap(); preparedCache.set(c._id, perSock); if (preparedCache.size > 50) preparedCache.delete(preparedCache.keys().next().value); }
+    const hit = perSock.get(sock);
+    if (hit && now() - hit.at < PREPARED_TTL_MS) return hit.inner;
+    const inner = await buildStatusInner(sock, c);
+    perSock.set(sock, { at: now(), inner });
+    return inner;
+  }
   async function sendOne(sock, jid, c) {
     if (!String(jid).endsWith('@g.us')) throw new Error('not-group');
-    const { content, cleanup } = buildContent(c);
-    try { await withTimeout(sock.sendMessage(jid, content), CFG.sendTimeoutMs, 'send'); } finally { cleanup(); }
+    const { generateWAMessageFromContent } = require('@whiskeysockets/baileys');
+    const inner = await withTimeout(statusInnerFor(sock, c), CFG.sendTimeoutMs, 'prepare');
+    const msg = generateWAMessageFromContent(jid, { groupStatusMessageV2: { message: inner } }, { userJid: sock.user.id });
+    await withTimeout(sock.relayMessage(jid, msg.message, { messageId: msg.key.id }), CFG.sendTimeoutMs, 'send');
   }
 
   // ---- one scheduled cycle of one campaign
@@ -309,7 +347,7 @@ function createScheduler({ store, getSessions, now = () => Date.now(), logger = 
   }
 
   return {
-    create, activate, stop, remove, runNow, preview, buildContent, tick, start, setReady, stopScheduler,
+    create, activate, stop, remove, runNow, preview, buildContent, sendOne, tick, start, setReady, stopScheduler,
     get: (id) => store.get(id), list: (f) => store.list(f || {}),
     _forceReady() { ready = true; },
     isRunning: () => running,

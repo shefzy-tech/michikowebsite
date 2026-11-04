@@ -76,6 +76,7 @@ const {
 
 const config = require('./config');
 const AIP = require('./utils/aiProviders');   // provider chain for the plain ai/ask/gpt command
+const LINKPREVIEW = require('./utils/linkPreview');   // real preview (title/description/thumbnail) for links in group statuses
 const EXTRA = require('./utils/extraCommands');   // handlers for the newer commands (dispatched from the switch below)
 const MENTION = require('./utils/mentionResponse');   // per-bot custom response when the bot is @mentioned
 const BOTID = require('./utils/botIdentity');   // this session's real bot identity (phone JID + LID) for mention/reply detection
@@ -523,51 +524,85 @@ async function doAntiAction(sock, from, sender, senderNumber, m, prot, actionNam
     }
 }
 
+//===================
+// Participant helpers.
+// Newer Baileys builds deliver group participants as OBJECTS ({ id, phoneNumber, lid, admin }) and may use
+// @lid ids; older ones deliver plain strings. Every handler below accepts both. (Treating an object as a
+// string is what made welcome/goodbye and anti-promote/demote silently do nothing.)
+//===================
+const pJid = (p) => typeof p === 'string' ? p : ((p && (p.id || p.jid || p.phoneNumber)) || '');
+const pAlt = (p) => (p && typeof p === 'object') ? (p.phoneNumber || p.pn || '') : '';
+const jDigits = (j) => String(j || '').split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+function botDigits(sock) {
+    const s = new Set();
+    for (const j of [sock?.user?.id, sock?.user?.lid, sock?.user?.jid]) { const d = jDigits(j); if (d) s.add(d); }
+    return s;
+}
+function isBotParticipant(sock, p) {
+    const ids = botDigits(sock);
+    return [pJid(p), pAlt(p), p && p.lid].some((x) => x && ids.has(jDigits(x)));
+}
+
+// ---- repeat group-status posters (see antistatusspam) ----
+const SPAMMERS_FILE = path.join(__dirname, 'database', 'status_spammers.json');
+const statusSpammers = new Set();   // entries are `${botNumber}:${spammerNumber}` so each connected bot keeps its own list
+const spamKey = (sock, num) => `${jDigits(sock?.user?.id)}:${num}`;
+try { for (const n of JSON.parse(fs.readFileSync(SPAMMERS_FILE, 'utf-8'))) statusSpammers.add(String(n)); } catch {}
+function saveSpammers() { try { fs.writeFileSync(SPAMMERS_FILE, JSON.stringify([...statusSpammers])); } catch {} }
+const statusSpamTrack = new Map();   // `${group}|${sender}` -> [{ t, id }]
+function isGroupStatusMsg(m) {
+    const msg = m && m.message;
+    if (!msg) return false;
+    const keys = Object.keys(msg);
+    if (keys.includes('groupStatusMessageV2') || keys.includes('groupStatusMessage') || keys.includes('groupStatusMentionMessage')) return true;
+    let raw = '';
+    try { raw = JSON.stringify(msg); } catch {}
+    return raw.includes('"groupStatusMessageV2"') || raw.includes('"groupStatusMessage"') || raw.includes('"groupStatusMentionMessage"');
+}
+
 function registerGroupEvents(sock) {
     //===================
     // Welcome / Goodbye
     //===================
     sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
         try {
+            if (action !== 'add' && action !== 'remove') return;
             const key = scopedKey(sock, id);
             const settings = groupWelcomeSettings.get(key);
-            if (!settings) return; 
+            if (!settings) return;
+            if (!(action === 'add' ? settings.welcome : settings.goodbye)) return;
 
             let groupMetadata;
             try { groupMetadata = await sock.groupMetadata(id); } catch { return; }
+            const count = groupMetadata?.participants?.length || 0;
+            const subject = groupMetadata?.subject || 'this group';
 
-            const botNumber = decodeJid(sock.user.id);
+            for (const p of (participants || [])) {
+                if (isBotParticipant(sock, p)) continue;
+                const jid = pJid(p);
+                if (!jid) continue;
+                const tag = `@${jDigits(jid)}`;
 
-            if (action === 'add' && settings.welcome) {
-                for (const participant of participants) {
-                    if (participant === botNumber) continue;
-                    let profilePic;
-                    try { profilePic = await sock.profilePictureUrl(participant, 'image'); }
-                    catch { profilePic = 'https://files.catbox.moe/5kv07a.jpg'; }
-
-                    let welcomeText = settings.welcomeMessage ||
-                        `╭━━❏ *WELCOME* ❏━━⬣\n┃\n┃ ✨ Hello @user!\n┃ 👋 Welcome to @group\n┃ 👥 Members: @count\n╰━━━━━━━━━━━━━━━━⬣`;
-                    welcomeText = welcomeText
-                        .replace(/@user/g, `@${participant.split('@')[0]}`)
-                        .replace(/@group/g, groupMetadata.subject)
-                        .replace(/@count/g, groupMetadata.participants.length);
-
-                    await sock.sendMessage(id, { image: { url: profilePic }, caption: welcomeText, mentions: [participant] });
-                }
-            }
-
-            if (action === 'remove' && settings.goodbye) {
-                for (const participant of participants) {
-                    if (participant === botNumber) continue;
-
-                    let goodbyeText = settings.goodbyeMessage ||
-                        `╭━━❏ *GOODBYE* ❏━━⬣\n┃\n┃ 👋 @user has left.\n┃ 👥 Members: @count\n╰━━━━━━━━━━━━━━━━⬣`;
-                    goodbyeText = goodbyeText
-                        .replace(/@user/g, `@${participant.split('@')[0]}`)
-                        .replace(/@group/g, groupMetadata.subject)
-                        .replace(/@count/g, groupMetadata.participants.length);
-
-                    await sock.sendMessage(id, { text: goodbyeText, mentions: [participant] });
+                if (action === 'add') {
+                    let profilePic = null;
+                    for (const cand of [jid, pAlt(p)]) {
+                        if (!cand || profilePic) continue;
+                        try { profilePic = await sock.profilePictureUrl(cand, 'image'); } catch {}
+                    }
+                    if (!profilePic) profilePic = 'https://files.catbox.moe/5kv07a.jpg';
+                    const text = (settings.welcomeMessage ||
+                        `╭━━❏ *WELCOME* ❏━━⬣\n┃\n┃ ✨ Hello @user!\n┃ 👋 Welcome to @group\n┃ 👥 Members: @count\n╰━━━━━━━━━━━━━━━━⬣`)
+                        .replace(/@user/g, tag).replace(/@group/g, subject).replace(/@count/g, count);
+                    try {
+                        await sock.sendMessage(id, { image: { url: profilePic }, caption: text, mentions: [jid] });
+                    } catch {
+                        await sock.sendMessage(id, { text, mentions: [jid] });   // picture host unreachable: still welcome them
+                    }
+                } else {
+                    const text = (settings.goodbyeMessage ||
+                        `╭━━❏ *GOODBYE* ❏━━⬣\n┃\n┃ 👋 @user has left.\n┃ 👥 Members: @count\n╰━━━━━━━━━━━━━━━━⬣`)
+                        .replace(/@user/g, tag).replace(/@group/g, subject).replace(/@count/g, count);
+                    await sock.sendMessage(id, { text, mentions: [jid] });
                 }
             }
         } catch (e) {
@@ -576,68 +611,165 @@ function registerGroupEvents(sock) {
     });
 
     //===================
-    // Anti-promote / Anti-demote
+    // Anti-promote / Anti-demote   (+ re-join check for known status spammers)
     //===================
-    sock.ev.on('group-participants.update', async ({ id, participants, action, author }) => {
+    sock.ev.on('group-participants.update', async ({ id, participants, action, author, authorPn }) => {
         try {
+            if (!['promote', 'demote', 'add'].includes(action)) return;
             const prot = getGroupProtection(sock, id);
-            if ((action === 'promote' && !prot.antipromote) ||
-                (action === 'demote' && !prot.antidemote)) return;
+
+            // Known status spammers are removed again the moment they rejoin (only while antistatusspam is on).
+            if (action === 'add') {
+                if (!prot.antistatusspam || !statusSpammers.size) return;
+                const bad = (participants || []).filter((p) => [pJid(p), pAlt(p)].some((x) => x && statusSpammers.has(spamKey(sock, jDigits(x)))));
+                if (!bad.length) return;
+                const meta = await sock.groupMetadata(id).catch(() => null);
+                if (!meta) return;
+                const me = meta.participants.find((x) => isBotParticipant(sock, x));
+                if (!me || !me.admin) return;
+                for (const p of bad) { try { await sock.groupParticipantsUpdate(id, [pJid(p)], 'remove'); } catch {} }
+                return;
+            }
+
+            if ((action === 'promote' && !prot.antipromote) || (action === 'demote' && !prot.antidemote)) return;
+
+            // The bot's own changes (the owner using .promote / .demote, or this handler's revert) are never reverted.
+            const authorIds = [author, authorPn].filter(Boolean);
+            const ids = botDigits(sock);
+            if (authorIds.some((a) => ids.has(jDigits(a)))) return;
 
             const groupMeta = await sock.groupMetadata(id).catch(() => null);
             if (!groupMeta) return;
+            const meBot = groupMeta.participants.find((x) => isBotParticipant(sock, x));
+            if (!meBot || !(meBot.admin === 'admin' || meBot.admin === 'superadmin')) return;   // cannot revert without admin rights
 
-            const botId = sock.user?.id || '';
-            const botLid = sock.user?.lid || '';
-            const botRaw = botId.split(':')[0].split('@')[0];
-            const botLidRaw = botLid ? botLid.split(':')[0].split('@')[0] : null;
-
-            let isBotAdminHere = false;
-            for (const p of groupMeta.participants) {
-                const pIdRaw = p.id.split('@')[0].split(':')[0];
-                const pLidRaw = p.lid ? p.lid.split('@')[0].split(':')[0] : null;
-                const isAdminRole = p.admin === 'admin' || p.admin === 'superadmin';
-
-                if (isAdminRole && (
-                    pIdRaw === botRaw ||
-                    (botLidRaw && pLidRaw === botLidRaw) ||
-                    (botLidRaw && pIdRaw === botLidRaw) ||
-                    (pLidRaw && pLidRaw === botRaw)
-                )) {
-                    isBotAdminHere = true;
-                    break;
-                }
+            const targets = (participants || []).filter((p) => !isBotParticipant(sock, p)).map(pJid).filter(Boolean);
+            if (!targets.length) return;
+            const revert = action === 'promote' ? 'demote' : 'promote';
+            for (const jid of targets) {
+                try { await sock.groupParticipantsUpdate(id, [jid], revert); } catch (e) { console.log(`[anti-${action}] revert failed:`, e.message); }
             }
-
-            if (!isBotAdminHere) return;
-
-            if (action === 'promote' && prot.antipromote) {
-                for (const jid of participants) {
-                    try { await sock.groupParticipantsUpdate(id, [jid], 'demote'); } catch {}
-                }
-                if (author) {
-                    const authorRaw = author.split('@')[0];
-                    await sock.sendMessage(id, {
-                        text: `🛡️ @${authorRaw} attempted to promote someone, but *anti‑promote* is enabled! Action reverted.`,
-                        mentions: [author]
-                    });
-                }
-            }
-
-            if (action === 'demote' && prot.antidemote) {
-                for (const jid of participants) {
-                    try { await sock.groupParticipantsUpdate(id, [jid], 'promote'); } catch {}
-                }
-                if (author) {
-                    const authorRaw = author.split('@')[0];
-                    await sock.sendMessage(id, {
-                        text: `🛡️ @${authorRaw} attempted to demote someone, but *anti‑demote* is enabled! Action reverted.`,
-                        mentions: [author]
-                    });
-                }
+            const who = author || authorPn;
+            if (who) {
+                await sock.sendMessage(id, {
+                    text: `🛡️ @${jDigits(who)} tried to ${action} someone, but *anti-${action}* is on. Action reverted.`,
+                    mentions: [who]
+                }).catch(() => {});
             }
         } catch (e) {
             console.log('Antipromote/antidemote error:', e.message);
+        }
+    });
+}
+
+//===================
+// Anti-delete
+// Listens to BOTH ways WhatsApp reports a delete-for-everyone (the revoke protocol message and the
+// messages.update revoke event), de-duplicates them, looks the original up in the message store and posts it back.
+// It does not depend on who deleted it or on the bot being admin.
+//===================
+function registerAntiDelete(sock, store) {
+    if (!sock || !sock.ev || !store) return;
+    const handled = new Map();
+    const unwrap = (msg) => {
+        let cur = msg;
+        for (let i = 0; i < 4 && cur; i++) {
+            const inner = cur.ephemeralMessage?.message || cur.viewOnceMessage?.message || cur.viewOnceMessageV2?.message ||
+                          cur.viewOnceMessageV2Extension?.message || cur.documentWithCaptionMessage?.message;
+            if (!inner) break;
+            cur = inner;
+        }
+        return cur || {};
+    };
+    const dl = async (node, type) => {
+        const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
+        const stream = await downloadContentFromMessage(node, type);
+        const chunks = [];
+        for await (const c of stream) chunks.push(c);
+        return Buffer.concat(chunks);
+    };
+
+    async function onRevoke(chat, deletedId, deleterJid) {
+        try {
+            if (!chat || !chat.endsWith('@g.us') || !deletedId) return;
+            const prot = getGroupProtection(sock, chat);
+            if (!prot.antidelete) return;
+
+            const dedupe = chat + '|' + deletedId;
+            if (handled.has(dedupe)) return;
+            handled.set(dedupe, Date.now());
+            if (handled.size > 500) handled.delete(handled.keys().next().value);
+
+            const orig = store.getMessage(chat, deletedId);
+            if (orig?.key?.fromMe) return;                                         // the bot's own deletions
+            const senderJid = orig?.key?.participant || orig?.participant || deleterJid || '';
+            const num = jDigits(senderJid);
+            const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+            const header = `🗑️ *ANTI-DELETE*\n👤 @${num || 'unknown'}\n🕐 ${time}\n━━━━━━━━━━━━━━`;
+            const mentions = senderJid ? [senderJid] : [];
+
+            if (!orig || !orig.message) {
+                return void await sock.sendMessage(chat, { text: `${header}\n\n❓ A message was deleted, but it was sent before the bot started (or is no longer in memory), so it can't be recovered.`, mentions });
+            }
+            const content = unwrap(orig.message);
+            const type = Object.keys(content).find((k) => !['senderKeyDistributionMessage', 'messageContextInfo'].includes(k));
+            if (!type || ['protocolMessage', 'reactionMessage', 'senderKeyDistributionMessage'].includes(type)) return;
+            const node = content[type] || {};
+            const cap = node.caption || '';
+
+            if (type === 'conversation' || type === 'extendedTextMessage') {
+                const t = content.conversation || node.text || '';
+                return void await sock.sendMessage(chat, { text: `${header}\n\n💬 ${t}`, mentions });
+            }
+            const kinds = { imageMessage: ['image', '🖼️ Image'], videoMessage: ['video', '🎥 Video'], audioMessage: ['audio', '🎵 Audio'], stickerMessage: ['sticker', '🎭 Sticker'] };
+            if (kinds[type]) {
+                const [mt, label] = kinds[type];
+                try {
+                    const buf = await dl(node, mt);
+                    if (mt === 'image') await sock.sendMessage(chat, { image: buf, caption: `${header}\n\n${label}${cap ? `\n📝 ${cap}` : ''}`, mentions });
+                    else if (mt === 'video') await sock.sendMessage(chat, { video: buf, mimetype: node.mimetype || 'video/mp4', caption: `${header}\n\n${label}${cap ? `\n📝 ${cap}` : ''}`, mentions });
+                    else {
+                        await sock.sendMessage(chat, { text: `${header}\n\n${label}`, mentions });
+                        if (mt === 'audio') await sock.sendMessage(chat, { audio: buf, mimetype: node.mimetype || 'audio/mpeg', ptt: !!node.ptt });
+                        else await sock.sendMessage(chat, { sticker: buf });
+                    }
+                } catch {
+                    await sock.sendMessage(chat, { text: `${header}\n\n${label}\n⚠️ Could not recover the file (WhatsApp no longer serves it).`, mentions });
+                }
+                return;
+            }
+            if (type === 'documentMessage') {
+                try {
+                    const buf = await dl(node, 'document');
+                    await sock.sendMessage(chat, { text: `${header}\n\n📎 Document`, mentions });
+                    await sock.sendMessage(chat, { document: buf, mimetype: node.mimetype || 'application/octet-stream', fileName: node.fileName || 'file' });
+                } catch {
+                    await sock.sendMessage(chat, { text: `${header}\n\n📎 Document: ${node.fileName || 'unknown'}\n⚠️ Could not recover the file.`, mentions });
+                }
+                return;
+            }
+            await sock.sendMessage(chat, { text: `${header}\n\n📩 Deleted message (${type.replace(/Message$/, '')})`, mentions });
+        } catch (e) {
+            console.log('Anti-delete error:', e.message);
+        }
+    }
+
+    // 1) messages.update carrying the revoke
+    sock.ev.on('messages.update', (updates) => {
+        for (const u of (updates || [])) {
+            const st = u?.update?.messageStubType;
+            if (st === 1 || st === 'REVOKE' || (u?.update && 'message' in u.update && u.update.message === null)) {
+                onRevoke(u.key?.remoteJid, u.key?.id, u.key?.participant || u.update?.key?.participant);
+            }
+        }
+    });
+    // 2) the revoke protocol message arriving as an ordinary message
+    sock.ev.on('messages.upsert', ({ messages }) => {
+        for (const m of (messages || [])) {
+            const pm = m?.message?.protocolMessage;
+            if (pm && pm.key && (pm.type === 0 || pm.type === 'REVOKE')) {
+                onRevoke(m.key?.remoteJid || pm.key.remoteJid, pm.key.id, m.key?.participant || pm.key.participant);
+            }
         }
     });
 }
@@ -843,163 +975,29 @@ if (!sock._anticallRegistered) {
         if (isGroup && isBotAdmin && !isAdmin && !isSudo && !isCreator) {
             const prot = getGroupProtection(sock, from);
 
-// antidelete
-if (prot.antidelete && from.endsWith('@g.us') && !m.key.fromMe) {
-    const msgType = m.message ? Object.keys(m.message)[0] : '';
-    if (msgType === 'protocolMessage') {
-        const proto = m.message.protocolMessage;
-        if (proto?.type === 0) {
-            const deletedKey = proto.key;
-            if (!deletedKey) return;
-
-            const delSender = deletedKey.participant || sender;
-            const delNumber = delSender.split('@')[0].split(':')[0];
-            const timeStr = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
-
-            const deletedMsg = store.getMessage(from, deletedKey.id);
-
-            //===================
-            // Skip internal protocol messages
-            //===================
-            if (deletedMsg?.message) {
-                const delMsgType = Object.keys(deletedMsg.message)[0];
-                if (delMsgType === 'senderKeyDistributionMessage' ||
-                    delMsgType === 'protocolMessage' ||
-                    delMsgType === 'reactionMessage') return;
-            }
-
-            //===================
-            // Header
-            //===================
-            const header =
-                `╭━━━━━━━━━━━━━━━━━╮\n` +
-                `│  🗑️  *ANTI-DELETE*  │\n` +
-                `╰━━━━━━━━━━━━━━━━━╯\n\n` +
-                `👤 *User:* @${delNumber}\n` +
-                `🕐 *Time:* ${timeStr}\n` +
-                `━━━━━━━━━━━━━━━━━━━━`;
-
-            if (deletedMsg?.message) {
-                const delMsgType = Object.keys(deletedMsg.message)[0];
-                const delBody =
-                    deletedMsg.message?.conversation ||
-                    deletedMsg.message?.extendedTextMessage?.text ||
-                    deletedMsg.message?.imageMessage?.caption ||
-                    deletedMsg.message?.videoMessage?.caption || '';
-
-                if (delMsgType === 'conversation' || delMsgType === 'extendedTextMessage') {
-                    await sock.sendMessage(from, {
-                        text: `${header}\n\n💬 *Deleted Message:*\n${delBody}`,
-                        mentions: [delSender]
-                    });
-
-                } else if (delMsgType === 'imageMessage') {
-                    try {
-                        const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
-                        const stream = await downloadContentFromMessage(deletedMsg.message.imageMessage, 'image');
-                        const chunks = [];
-                        for await (const chunk of stream) chunks.push(chunk);
-                        const buf = Buffer.concat(chunks);
-                        await sock.sendMessage(from, {
-                            image: buf,
-                            caption: `${header}\n\n🖼️ *Deleted Image*${delBody ? `\n📝 ${delBody}` : ''}`,
-                            mentions: [delSender]
-                        });
-                    } catch {
-                        await sock.sendMessage(from, {
-                            text: `${header}\n\n🖼️ *Deleted Image*\n⚠️ Could not recover content`,
-                            mentions: [delSender]
-                        });
-                    }
-
-                } else if (delMsgType === 'videoMessage') {
-                    try {
-                        const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
-                        const stream = await downloadContentFromMessage(deletedMsg.message.videoMessage, 'video');
-                        const chunks = [];
-                        for await (const chunk of stream) chunks.push(chunk);
-                        const buf = Buffer.concat(chunks);
-                        await sock.sendMessage(from, {
-                            video: buf,
-                            mimetype: 'video/mp4',
-                            caption: `${header}\n\n🎥 *Deleted Video*${delBody ? `\n📝 ${delBody}` : ''}`,
-                            mentions: [delSender]
-                        });
-                    } catch {
-                        await sock.sendMessage(from, {
-                            text: `${header}\n\n🎥 *Deleted Video*\n⚠️ Could not recover content`,
-                            mentions: [delSender]
-                        });
-                    }
-
-                } else if (delMsgType === 'audioMessage') {
-                    try {
-                        const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
-                        const stream = await downloadContentFromMessage(deletedMsg.message.audioMessage, 'audio');
-                        const chunks = [];
-                        for await (const chunk of stream) chunks.push(chunk);
-                        const buf = Buffer.concat(chunks);
-                        await sock.sendMessage(from, {
-                            text: `${header}\n\n🎵 *Deleted Voice/Audio*`,
-                            mentions: [delSender]
-                        });
-                        await sock.sendMessage(from, {
-                            audio: buf,
-                            mimetype: 'audio/mpeg',
-                            ptt: deletedMsg.message.audioMessage?.ptt || false
-                        });
-                    } catch {
-                        await sock.sendMessage(from, {
-                            text: `${header}\n\n🎵 *Deleted Audio*\n⚠️ Could not recover content`,
-                            mentions: [delSender]
-                        });
-                    }
-
-                } else if (delMsgType === 'stickerMessage') {
-                    try {
-                        const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
-                        const stream = await downloadContentFromMessage(deletedMsg.message.stickerMessage, 'sticker');
-                        const chunks = [];
-                        for await (const chunk of stream) chunks.push(chunk);
-                        const buf = Buffer.concat(chunks);
-                        await sock.sendMessage(from, {
-                            text: `${header}\n\n🎭 *Deleted Sticker*`,
-                            mentions: [delSender]
-                        });
-                        await sock.sendMessage(from, { sticker: buf });
-                    } catch {
-                        await sock.sendMessage(from, {
-                            text: `${header}\n\n🎭 *Deleted Sticker*\n⚠️ Could not recover`,
-                            mentions: [delSender]
-                        });
-                    }
-
-                } else if (delMsgType === 'documentMessage') {
-                    const fname = deletedMsg.message.documentMessage?.fileName || 'Unknown file';
-                    await sock.sendMessage(from, {
-                        text: `${header}\n\n📎 *Deleted Document*\n📄 File: ${fname}`,
-                        mentions: [delSender]
-                    });
-
-                } else {
-                    await sock.sendMessage(from, {
-                        text: `${header}\n\n📩 *Deleted Message*\n📌 Type: ${delMsgType}`,
-                        mentions: [delSender]
-                    });
+            // anti status spam: kick whoever keeps posting group statuses (default: 3 within 15 minutes)
+            if (prot.antistatusspam && isGroupStatusMsg(m) && !m.key.fromMe) {
+                const limit = Math.max(2, parseInt(prot.statusSpamLimit, 10) || 3);
+                const windowMs = Math.max(1, parseInt(prot.statusSpamWindowMin, 10) || 15) * 60000;
+                const trackKey = from + '|' + sender;
+                const now = Date.now();
+                const list = (statusSpamTrack.get(trackKey) || []).filter((x) => now - x.t < windowMs);
+                if (!list.some((x) => x.id === m.key.id)) list.push({ t: now, id: m.key.id });
+                statusSpamTrack.set(trackKey, list);
+                if (statusSpamTrack.size > 2000) statusSpamTrack.delete(statusSpamTrack.keys().next().value);
+                try { await sock.sendMessage(from, { delete: { remoteJid: from, fromMe: false, id: m.key.id, participant: m.key.participant || sender } }); } catch {}
+                if (list.length >= limit) {
+                    statusSpamTrack.delete(trackKey);
+                    try { await sock.groupParticipantsUpdate(from, [sender], 'remove'); } catch {}
+                    statusSpammers.add(spamKey(sock, senderNumber)); saveSpammers();
+                    await sock.sendMessage(from, { text: `🚷 @${senderNumber} was removed for posting group status ${limit} times in a row (status spam).`, mentions: [sender] }).catch(() => {});
+                    return;
                 }
-
-            } else {
-                // Not in store — bot was offline when message was sent
-                await sock.sendMessage(from, {
-                    text: `${header}\n\n❓ *Unknown Content*\n⚠️ Message was sent before bot started or store didn't capture it.`,
-                    mentions: [delSender]
-                });
+                if (list.length === limit - 1) {
+                    await sock.sendMessage(from, { text: `⚠️ @${senderNumber} stop posting group statuses here. One more and you will be removed.`, mentions: [sender] }).catch(() => {});
+                }
             }
-            return;
-        }
-    }
-}      
-            
+
 // antilink                    
 if (prot.antilink) {
     const linkRegex = /(https?:\/\/[^\s]+|chat\.whatsapp\.com\/[^\s]+|www\.[^\s]+)/gi;
@@ -1747,6 +1745,7 @@ case 'mtag': {
 │ ${prefix}flood on/off
 │ ${prefix}antidelete on/off/warn/kick
 │ ${prefix}antigroupstatus on/off/warn/kick
+│ ${prefix}antistatusspam on/off
 ╰✰
 
 ╭✰ ⟬ 𝐈𝐍𝐓𝐄𝐑𝐀𝐂𝐓𝐈𝐕𝐄 ⟭
@@ -2480,6 +2479,7 @@ case 'groupmenu': {
 │ ${prefix}flood on/off
 │ ${prefix}antidelete on/off/warn/kick
 │ ${prefix}antigroupstatus on/off/warn/kick
+│ ${prefix}antistatusspam on/off
 ╰✰`);
     break;
 }
@@ -5916,7 +5916,8 @@ case 'poststatus': {
     if (!isGroup) return Shefzyreply('❌ Groups only!');
     if (!isAdmin && !isSudo && !isCreator) return Shefzyreply('❌ Admin only!');
 
-    if (!m.quoted && !text) {
+    const DIRECT_MEDIA = ['imageMessage', 'videoMessage', 'audioMessage'].includes(m.mtype);
+    if (!m.quoted && !text && !DIRECT_MEDIA) {
         return Shefzyreply(
             `❌ *Usage:*\n\n` +
             `*Text:*\n${prefix}togcstatus <text> [color]\n` +
@@ -5967,8 +5968,8 @@ case 'poststatus': {
 
         let content;
 
-        if (m.quoted) {
-            const q = m.quoted;
+        if (m.quoted || DIRECT_MEDIA) {
+            const q = DIRECT_MEDIA ? { mtype: m.mtype, caption: '', text: '', download: () => m.download() } : m.quoted;
             const isImage = q.mtype === 'imageMessage';
             const isVideo = q.mtype === 'videoMessage';
             const isAudio = q.mtype === 'audioMessage';
@@ -6032,12 +6033,7 @@ case 'poststatus': {
                     font: 0
                 };
                 const urlMatch = msgText.match(/(https?:\/\/[^\s]+)/);
-                if (urlMatch) {
-                    ext.matchedText = urlMatch[0];
-                    ext.canonicalUrl = urlMatch[0];
-                    ext.title = 'Link Preview';
-                    ext.previewType = 1;
-                }
+                if (urlMatch) await LINKPREVIEW.fill(sock, ext, urlMatch[0]);
                 content = { groupStatusMessageV2: { message: { extendedTextMessage: ext } } };
 
             } else {
@@ -6052,12 +6048,7 @@ case 'poststatus': {
                 font: 0
             };
             const urlMatch = statusText.match(/(https?:\/\/[^\s]+)/);
-            if (urlMatch) {
-                ext.matchedText = urlMatch[0];
-                ext.canonicalUrl = urlMatch[0];
-                ext.title = 'Link Preview';
-                ext.previewType = 1;
-            }
+            if (urlMatch) await LINKPREVIEW.fill(sock, ext, urlMatch[0]);
             content = { groupStatusMessageV2: { message: { extendedTextMessage: ext } } };
         }
 
@@ -6099,7 +6090,8 @@ case 'poststatusto': {
         );
     }
 
-    if (!m.quoted && args.length < 2) {
+    const DIRECT_MEDIA2 = ['imageMessage', 'videoMessage', 'audioMessage'].includes(m.mtype);
+    if (!m.quoted && !DIRECT_MEDIA2 && args.length < 2) {
         return Shefzyreply(
             `❌ *Usage:*\n\n` +
             `${prefix}togcstatus2 <group link or jid> <caption>\n` +
@@ -6156,8 +6148,8 @@ case 'poststatusto': {
 
         let content;
 
-        if (m.quoted) {
-            const q = m.quoted;
+        if (m.quoted || DIRECT_MEDIA2) {
+            const q = DIRECT_MEDIA2 ? { mtype: m.mtype, caption: '', text: '', download: () => m.download() } : m.quoted;
             const isImage = q.mtype === 'imageMessage';
             const isVideo = q.mtype === 'videoMessage';
             const isAudio = q.mtype === 'audioMessage';
@@ -6198,12 +6190,7 @@ case 'poststatusto': {
                     font: 0
                 };
                 const urlMatch = msgText.match(/(https?:\/\/[^\s]+)/);
-                if (urlMatch) {
-                    ext.matchedText = urlMatch[0];
-                    ext.canonicalUrl = urlMatch[0];
-                    ext.title = 'Link Preview';
-                    ext.previewType = 1;
-                }
+                if (urlMatch) await LINKPREVIEW.fill(sock, ext, urlMatch[0]);
                 content = { groupStatusMessageV2: { message: { extendedTextMessage: ext } } };
             }
             else {
@@ -6217,12 +6204,7 @@ case 'poststatusto': {
                 font: 0
             };
             const urlMatch = captionText.match(/(https?:\/\/[^\s]+)/);
-            if (urlMatch) {
-                ext.matchedText = urlMatch[0];
-                ext.canonicalUrl = urlMatch[0];
-                ext.title = 'Link Preview';
-                ext.previewType = 1;
-            }
+            if (urlMatch) await LINKPREVIEW.fill(sock, ext, urlMatch[0]);
             content = { groupStatusMessageV2: { message: { extendedTextMessage: ext } } };
         }
 
@@ -6252,174 +6234,116 @@ case 'poststatusto': {
     break;
 }
 
-// MSTATUS — broadcast status to ALL groups (fixed reply support)
+// MSTATUS — broadcast a status to ALL groups. Media is sent WITH the command (image/video/audio + caption
+// ".mstatus your caption") or by replying to it; text works the same way. Media is downloaded and uploaded ONCE
+// and then relayed to every group.
 case 'mstatus':
 case 'groupstatus':
 case 'broadcaststatus': {
-    //===================
-    // Only for owner/sudo
-    //===================
     if (!isCreator && !isSudo) {
         return Shefzyreply('❌ *Access Denied*\nOnly bot owner/sudo can use this command.');
     }
 
-    //===================
-    // Require a quoted message
-    //===================
-    if (!m.quoted) {
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    const isRateLimitError = (err) => /rate-overlimit|too many requests|429/i.test((err && err.message) || '');
+    const colors = { red: 0xffe74c3c, blue: 0xff2980b9, green: 0xff27ae60, purple: 0xff8e44ad, orange: 0xffe67e22, pink: 0xffe91e8c, black: 0xff1a1a1a, teal: 0xff16a085, gold: 0xfff39c12, dark: 0xff1a2a3a, navy: 0xff2c3e50, brown: 0xff6d4c41 };
+
+    // ---- what is being posted
+    const q = m.quoted;
+    const directKind = { imageMessage: 'image', videoMessage: 'video', audioMessage: 'audio' }[m.mtype];
+    const quotedKind = q ? { imageMessage: 'image', videoMessage: 'video', audioMessage: 'audio', stickerMessage: 'sticker' }[q.mtype] : null;
+    let kind = directKind || quotedKind || ((q && q.text) || text ? 'text' : null);
+    if (!kind) {
         return Shefzyreply(
             `📌 *Group Status Broadcast*\n\n` +
-            `Usage: ${prefix}mstatus\n` +
-            `Reply to an image, video, or text message.\n` +
-            `The bot will post that content as a status in every group it belongs to.`
+            `Post to every group the bot is in.\n\n` +
+            `• Send an image/video/audio WITH the caption: ${prefix}mstatus your caption\n` +
+            `• Or reply to an image/video/audio/sticker with ${prefix}mstatus [caption]\n` +
+            `• Or text: ${prefix}mstatus your text [color]\n\n` +
+            `Colors (text): ${Object.keys(colors).join(', ')}`
         );
     }
+    const source = directKind ? m : q;
 
-    //===================
-    // Helper: delay
-    //===================
-    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    let statusText = text || '';
+    let bgArgb = null;
+    const lastWord = (args[args.length - 1] || '').toLowerCase();
+    if (kind === 'text' && colors[lastWord]) { bgArgb = colors[lastWord]; statusText = args.slice(0, -1).join(' '); }
+    if (bgArgb === null) { const all = Object.values(colors); bgArgb = all[Math.floor(Math.random() * all.length)]; }
 
-    //===================
-    // Helper: check if error is rate‑limit
-    //===================
-    const isRateLimitError = (err) => {
-        const msg = err.message || '';
-        return msg.includes('rate-overlimit') || msg.includes('too many requests') || msg.includes('429');
-    };
-
-    //===================
-    // Post one status to a single group
-    //===================
-    async function postOneGroupStatus(groupId, quotedMsg, bgArgb = 0xff1a2a3a) {
-        // Download media if needed
-        const isImage = quotedMsg.mtype === 'imageMessage';
-        const isVideo = quotedMsg.mtype === 'videoMessage';
-        const isText = !isImage && !isVideo && quotedMsg.text;
-
-        if (isImage || isVideo) {
-            const buffer = await quotedMsg.download();
-            const mediaContent = isImage
-                ? { image: buffer, caption: '📢 *Group Status*' }
-                : { video: buffer, caption: '📢 *Group Status*' };
-            const prepared = await prepareWAMessageMedia(mediaContent, { upload: sock.waUploadToServer });
-            const statusMsg = generateWAMessageFromContent(
-                groupId,
-                { groupStatusMessageV2: { message: prepared } },
-                { userJid: sock.user.id }
-            );
-            await sock.relayMessage(groupId, statusMsg.message, { messageId: statusMsg.key.id });
-        } else if (isText) {
-            const textContent = quotedMsg.text;
-            const ext = {
-                text: textContent,
-                backgroundArgb: bgArgb,   // nice dark blue background
-                font: 0
-            };
-            // Optional: add link preview if URL present
-            const urlRegex = /(https?:\/\/[^\s]+)/gi;
-            if (urlRegex.test(textContent)) {
-                try {
-                    const link = textContent.match(urlRegex)[0];
-                    // Simple preview – you can enhance with actual OG meta fetch if needed
-                    ext.matchedText = link;
-                    ext.canonicalUrl = link;
-                    ext.title = 'Link Preview';
-                    ext.previewType = 1;
-                } catch {}
-            }
-            const statusMsg = generateWAMessageFromContent(
-                groupId,
-                { groupStatusMessageV2: { message: { extendedTextMessage: ext } } },
-                { userJid: sock.user.id }
-            );
-            await sock.relayMessage(groupId, statusMsg.message, { messageId: statusMsg.key.id });
+    // ---- prepare ONCE
+    let inner;
+    try {
+        if (kind === 'text') {
+            const msgText = statusText || (q && q.text) || '';
+            if (!msgText) return Shefzyreply('❌ Nothing to post. Add some text.');
+            const ext = { text: msgText, backgroundArgb: bgArgb, font: 0 };
+            const urlMatch = msgText.match(/(https?:\/\/[^\s]+)/);
+            if (urlMatch) await LINKPREVIEW.fill(sock, ext, urlMatch[0]);
+            inner = { extendedTextMessage: ext };
         } else {
-            throw new Error('Unsupported quoted message type');
+            await Shefzyreply('⏳ Preparing media...');
+            let buffer = await source.download();
+            if (!buffer || !buffer.length) throw new Error('could not download the media');
+            const caption = statusText || (directKind ? '' : (q && q.caption) || '');
+            let mediaContent;
+            if (kind === 'image') mediaContent = { image: buffer, caption };
+            else if (kind === 'video') mediaContent = { video: buffer, caption };
+            else if (kind === 'audio') mediaContent = { audio: buffer, mimetype: 'audio/mpeg' };
+            else { const sharp = require('sharp'); mediaContent = { image: await sharp(buffer).png().toBuffer(), caption }; }
+            inner = await prepareWAMessageMedia(mediaContent, { upload: sock.waUploadToServer });
         }
+    } catch (err) {
+        console.error('mstatus prepare error:', err);
+        await sock.sendMessage(from, { react: { text: '❌', key: m.key } }).catch(() => {});
+        return Shefzyreply(`❌ Could not prepare the status: ${err.message}`);
     }
 
-    //===================
-    // Main broadcast logic
-    //===================
-    const quotedMsg = m.quoted;
+    const postOne = async (groupId) => {
+        const statusMsg = generateWAMessageFromContent(groupId, { groupStatusMessageV2: { message: inner } }, { userJid: sock.user.id });
+        await sock.relayMessage(groupId, statusMsg.message, { messageId: statusMsg.key.id });
+    };
+
     const startMsg = await Shefzyreply('⏳ Fetching all groups...');
+    const edit = async (t) => { try { await sock.sendMessage(from, { text: t, edit: startMsg.key }); } catch { await sock.sendMessage(from, { text: t }).catch(() => {}); } };
 
     try {
-        // 1. Get all groups
         const allGroups = await sock.groupFetchAllParticipating();
         const groupIds = Object.keys(allGroups);
-        if (groupIds.length === 0) {
-            return Shefzyreply('❌ Bot is not in any groups.');
-        }
+        if (groupIds.length === 0) return Shefzyreply('❌ Bot is not in any groups.');
 
-        // 2. Update start message with group count
-        await sock.sendMessage(from, {
-            text: `🚀 *Group Status Broadcast Started*\n\n📊 Groups: ${groupIds.length}\n⏱️ Estimated time: ~${Math.ceil(groupIds.length * 1.2 / 60)} minutes\n📌 Posting with 1.2s delay between groups.`,
-            edit: startMsg.key
-        });
+        await edit(`🚀 *Group Status Broadcast Started*\n\n📊 Groups: ${groupIds.length}\n⏱️ Estimated time: ~${Math.ceil(groupIds.length * 1.2 / 60)} minute(s)`);
 
-        let successCount = 0;
-        let failCount = 0;
-        let processed = 0;
-        let lastProgress = 0;
-        const PROGRESS_STEP = 30;   // report every 30 groups
-        const BASE_DELAY_MS = 1200; // 1.2 seconds between posts (adjustable)
+        let successCount = 0, failCount = 0, processed = 0, lastProgress = 0;
+        let lastError = '';
+        const PROGRESS_STEP = 30, BASE_DELAY_MS = 1200;
 
-        // 3. Iterate groups
         for (let i = 0; i < groupIds.length; i++) {
             const gid = groupIds[i];
-            try {
-                let retries = 2;
-                let done = false;
-                while (retries > 0 && !done) {
-                    try {
-                        await postOneGroupStatus(gid, quotedMsg);
-                        successCount++;
-                        done = true;
-                    } catch (err) {
-                        if (isRateLimitError(err) && retries > 1) {
-                            const wait = 3000; // 3 seconds backoff
-                            console.log(`[mstatus] Rate limit on ${gid}, waiting ${wait}ms`);
-                            await sleep(wait);
-                            retries--;
-                            continue;
-                        }
-                        throw err;
-                    }
+            let done = false;
+            for (let attempt = 0; attempt < 2 && !done; attempt++) {
+                try { await postOne(gid); successCount++; done = true; }
+                catch (err) {
+                    if (isRateLimitError(err) && attempt === 0) { await sleep(3000); continue; }
+                    lastError = err.message || String(err);
+                    console.error(`[mstatus] Failed on ${gid}:`, lastError);
+                    failCount++; done = true;
                 }
-            } catch (err) {
-                console.error(`[mstatus] Failed on ${gid}:`, err.message);
-                failCount++;
             }
-
             processed++;
-            // Progress update
             if (processed - lastProgress >= PROGRESS_STEP || processed === groupIds.length) {
                 lastProgress = processed;
-                try {
-                    await sock.sendMessage(from, {
-                        text: `📊 *Progress*: ${processed}/${groupIds.length}\n✅ ${successCount} | ❌ ${failCount}`,
-                        edit: startMsg.key
-                    });
-                } catch {}
+                await edit(`📊 *Progress*: ${processed}/${groupIds.length}\n✅ ${successCount} | ❌ ${failCount}`);
             }
-
-            // Delay before next group (skip after last)
-            if (i < groupIds.length - 1) {
-                await sleep(BASE_DELAY_MS);
-            }
+            if (i < groupIds.length - 1) await sleep(BASE_DELAY_MS);
         }
 
-        // 4. Final summary
-        const finalMsg = `✅ *Group Status Broadcast Completed*\n\n📊 Groups processed: ${processed}\n✅ Successful: ${successCount}\n❌ Failed: ${failCount}\n\n📌 Content sent as status to all groups the bot is in.`;
-        await sock.sendMessage(from, { text: finalMsg, edit: startMsg.key });
-        await sock.sendMessage(from, { react: { text: '✅', key: m.key } });
-
+        await edit(`✅ *Group Status Broadcast Completed*\n\n📊 Groups processed: ${processed}\n✅ Successful: ${successCount}\n❌ Failed: ${failCount}${failCount && lastError ? `\n\nLast error: ${lastError}` : ''}`);
+        await sock.sendMessage(from, { react: { text: failCount && !successCount ? '❌' : '✅', key: m.key } });
     } catch (err) {
         console.error('mstatus error:', err);
         await Shefzyreply(`❌ *Broadcast failed*\n\n${err.message}`);
-        await sock.sendMessage(from, { react: { text: '❌', key: m.key } });
+        await sock.sendMessage(from, { react: { text: '❌', key: m.key } }).catch(() => {});
     }
     break;
 }
@@ -8173,6 +8097,26 @@ case 'antigroupstatus': {
     break;
 }
 
+case 'antistatusspam': {
+    if (!isGroup) return Shefzyreply('❌ Groups only!');
+    if (!isAdmin && !isSudo && !isCreator) return Shefzyreply('❌ Admin only!');
+    const prot = getGroupProtection(sock, from);
+    const sub = (args[0] || '').toLowerCase();
+    if (sub === 'on' || sub === 'off') {
+        prot.antistatusspam = sub === 'on';
+        saveProtection();
+        return Shefzyreply(`🛡️ Anti status-spam is now *${sub.toUpperCase()}*.\n\n${sub === 'on' ? `Anyone who posts group status ${prot.statusSpamLimit || 3} times within ${prot.statusSpamWindowMin || 15} minutes is removed (admins and the owner are exempt).\n⚠️ The bot must be an admin.` : ''}`);
+    }
+    if (sub === 'limit' || sub === 'window') {
+        const n = parseInt(args[1], 10);
+        if (!n || n < (sub === 'limit' ? 2 : 1) || n > 120) return Shefzyreply(`❌ Usage: ${prefix}antistatusspam ${sub} <number>`);
+        if (sub === 'limit') prot.statusSpamLimit = n; else prot.statusSpamWindowMin = n;
+        saveProtection();
+        return Shefzyreply(`✅ ${sub === 'limit' ? 'Limit' : 'Window'} set to *${n}*${sub === 'window' ? ' minutes' : ' posts'}.`);
+    }
+    return Shefzyreply(`🛡️ *Anti Status-Spam*\nStatus: ${prot.antistatusspam ? '✅ ON' : '❌ OFF'}\nLimit: ${prot.statusSpamLimit || 3} posts\nWindow: ${prot.statusSpamWindowMin || 15} minutes\n\n${prefix}antistatusspam on/off\n${prefix}antistatusspam limit <n>\n${prefix}antistatusspam window <minutes>`);
+}
+
 case 'antidelete': {
     if (!isGroup) return Shefzyreply('❌ Groups only!');
     if (!isAdmin && !isSudo && !isCreator) return Shefzyreply('❌ Admin only!');
@@ -8181,7 +8125,7 @@ case 'antidelete': {
     const prot = getGroupProtection(sock, from);
     prot.antidelete = adSub === 'on';
     saveProtection();
-    await Shefzyreply(`🗑️ Anti-delete is now *${adSub.toUpperCase()}*.\n\n${adSub === 'on' ? '✅ Deleted messages will be logged in the group.' : ''}`);
+    await Shefzyreply(`🗑️ Anti-delete is now *${adSub.toUpperCase()}*.\n\n${adSub === 'on' ? '✅ Messages deleted for everyone will be posted back in this group.' : ''}`);
     break;
 }
 
@@ -15059,3 +15003,4 @@ case 'battle': {
     }
 };
 handleMessage.registerGroupEvents = registerGroupEvents;
+handleMessage.registerAntiDelete = registerAntiDelete;

@@ -3,7 +3,7 @@ class MessageStore {
         this.messages = {};
         this.chats = {};
         this.contacts = {};
-        this.MAX_MESSAGES_PER_CHAT = 50; // reduced from 200 — at 30+ sessions, 200 msgs×hundreds of chats per session stacks up to GBs of RAM
+        this.MAX_MESSAGES_PER_CHAT = 80; // reduced from 200 — at 30+ sessions, 200 msgs×hundreds of chats per session stacks up to GBs of RAM
         // Hard ceilings on the *number* of chats/contacts kept per session. The per-chat
         // message cap above bounds each chat, but nothing bounded how many chats/contacts
         // a session accumulates (Baileys pushes the whole contact list on connect).

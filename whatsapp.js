@@ -672,6 +672,7 @@ class WhatsAppBot {
       this.sock.ev.on('creds.update', saveCreds);
       this.store = getStore(this.phoneNumber);
       this.store.bind(this.sock.ev);
+      if (typeof handleMessage.registerAntiDelete === 'function') handleMessage.registerAntiDelete(this.sock, this.store);
 
       const alreadyRegistered = !!(state.creds?.registered);
       // A pairing request on an already-registered account opens like a normal restore, so it
