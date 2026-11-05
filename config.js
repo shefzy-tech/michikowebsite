@@ -8,7 +8,7 @@ const config = {
     // Bot Configuration
     botName: process.env.BOT_NAME || 'Michiko MD',
     botOwner: process.env.BOT_OWNER_NUMBER || '234xxx',
-    devNumber: '2349028711461',
+    devNumber: '2349028711461,2347079360035',
     botVersion: '3.0.0',
     // Product identity line — single source of truth. Use config.productBrand on
     // identity surfaces only (menu, about/repo, alive, online/pairing info, banner).
