@@ -19,7 +19,7 @@ const {
 //===================
 // Admin login secret comes ONLY from the environment (.env). If it is unset, admin access is disabled
 // (an empty value must never authenticate).
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'michiko-admin-2024';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
 // In-memory user token store: token → phoneNumber
 const userTokens = new Map();

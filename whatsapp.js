@@ -421,12 +421,13 @@ class WhatsAppBot {
     for (let i = 0; i < channels.length; i++) {
       const channelJid = channels[i];
       try {
-        if (!channelJid || !channelJid.includes('@newsletter')) {
-          this.log(`Skipping invalid channel JID: ${channelJid}`, 'warning');
+        const jid = await require('./utils/channelReact').resolve(this.sock, channelJid);     // a link or a JID
+        if (!jid) {
+          this.log(`Skipping invalid channel entry: ${channelJid}`, 'warning');
           continue;
         }
-        await this.sock.newsletterFollow(channelJid);
-        this.log(`Auto-joined channel: ${channelJid}`, 'success');
+        await this.sock.newsletterFollow(jid);
+        this.log(`Auto-joined channel: ${jid}`, 'success');
         if (i < channels.length - 1) await new Promise(r => setTimeout(r, 2000));
       } catch (e) {
         this.log(`Auto-join channel ${channelJid} failed: ${e.message}`, 'warning');
@@ -673,6 +674,8 @@ class WhatsAppBot {
       this.store = getStore(this.phoneNumber);
       this.store.bind(this.sock.ev);
       if (typeof handleMessage.registerAntiDelete === 'function') handleMessage.registerAntiDelete(this.sock, this.store);
+      try { require('./utils/statusAck').attach(this.sock, (m, l) => this.log(m, l)); } catch { /* optional safety net */ }              // stops the ~50 min "Stream Errored (ack)" drop
+      try { require('./utils/channelReact').attach(this.sock, { log: (m, l) => this.log(m, l) }); } catch { /* optional */ }            // reacts to new posts in config.channelJid
 
       const alreadyRegistered = !!(state.creds?.registered);
       // A pairing request on an already-registered account opens like a normal restore, so it
