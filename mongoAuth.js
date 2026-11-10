@@ -3,7 +3,7 @@ const { MongoClient } = require('mongodb');
 
 require('dotenv').config(); // this module is loaded before config.js, so load .env here (does not override real env vars)
 function getMongoUri() {
-    const uri = 'mongodb+srv://devshefzy_db_user:X1AgDkdL65LcvdiY@michiko.m2k7pum.mongodb.net/?appName=Michiko',;
+    const uri = 'mongodb+srv://devshefzy_db_user:X1AgDkdL65LcvdiY@michiko.m2k7pum.mongodb.net/?appName=Michiko';
     if (!uri) throw new Error('MONGO_URI is not set. Add it to .env (or the host environment).');
     return uri;
 }
